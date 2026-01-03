@@ -180,10 +180,20 @@ struct SwiftDependencyCompatibilityChecker: AsyncParsableCommand {
                     try? FileManager.default.removeItem(at: temporaryDirectory)
                 }
 
-                let buildDirectory = temporaryDirectory.appending(path: ".build", directoryHint: .isDirectory)
-                if FileManager.default.fileExists(atPath: buildDirectory.path()) {
-
-                    try FileManager.default.removeItem(at: buildDirectory)
+                _ = try await Subprocess.run(
+                    .name("swift"),
+                    arguments: [
+                        "package",
+                        "--package-path", temporaryDirectory.path(),
+                        "clean",
+                    ]
+                ) { execution, standardOutput in
+                    for try await line in standardOutput.lines() {
+                        await progressTracker.inProgressVersion(
+                            matchingTag,
+                            latestMessage: line
+                        )
+                    }
                 }
 
                 await progressTracker.inProgressVersion(

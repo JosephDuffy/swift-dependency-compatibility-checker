@@ -1,5 +1,6 @@
 import ArgumentParser
 import Foundation
+import OrderedCollections
 import SemanticVersion
 import Subprocess
 
@@ -16,6 +17,18 @@ struct SwiftDependencyCompatibilityChecker: AsyncParsableCommand {
 
     @Option(help: "The path to the package being tested. Defaults to working directory.")
     public var packagePath: String?
+
+    @Option(help: "The number of tests to run in parallel.")
+    public var numTests = 1
+
+    @Flag
+    public var resolveOnly = false
+
+    @Flag(name: .customLong("github-actions-matrix"))
+    public var gitHubActionsMatrix = false
+
+    @Flag(help: ArgumentHelp(visibility: .private))
+    public var mockTesting = false
 
     public func run() async throws {
         var dumpPackageArguments = [
@@ -59,21 +72,18 @@ struct SwiftDependencyCompatibilityChecker: AsyncParsableCommand {
             print("Couldn't find dependency")
             throw ExitCode(1)
         }
-        print(dependency)
 
         let range: SourceControlPackageDependencyRequirementRange =
             switch dependency.requirement {
             case .branch(let branch):
-                print("Dependency is pinned to a branch; no range to test.")
+                print("Dependency is pinned to '\(branch)' branch; no range to test.")
                 throw ExitCode(1)
             case .exact(let exact):
-                print("Dependency is pinned to a branch; no range to test.")
+                print("Dependency is pinned to '\(exact)'; no range to test.")
                 throw ExitCode(1)
             case .range(let range):
                 range
             }
-
-        print(range)
 
         guard let remoteURL = dependency.location.remote else {
             print("No remote location for depenency")
@@ -97,99 +107,310 @@ struct SwiftDependencyCompatibilityChecker: AsyncParsableCommand {
             print("Failed to determine remote git tags")
             throw ExitCode(1)
         }
-        let matchingTags = gitTagsOutput
-            .components(separatedBy: .newlines)
-            .lazy
-            .compactMap { $0.split(separator: "\t", maxSplits: 1).last }
-            .compactMap {
-                let prefix = "refs/tags/"
-                if $0.hasPrefix(prefix) {
-                    return String($0.dropFirst(prefix.count))
-                } else {
-                    return nil
+        let matchingTags = OrderedSet(
+            gitTagsOutput
+                .components(separatedBy: .newlines)
+                .lazy
+                .compactMap { $0.split(separator: "\t", maxSplits: 1).last }
+                .compactMap {
+                    let prefix = "refs/tags/"
+                    if $0.hasPrefix(prefix) {
+                        return String($0.dropFirst(prefix.count))
+                    } else {
+                        return nil
+                    }
                 }
+                .compactMap(SemanticVersion.init(_:))
+                .filter { $0.isStable && range.lowerBound <= $0 && $0 < range.upperBound }
+        )
+
+        if resolveOnly {
+            let jsonEncoder = JSONEncoder()
+            jsonEncoder.semanticVersionEncodingStrategy = .semverString
+            if gitHubActionsMatrix {
+                let matrix = GitHubActionsMatrix(
+                    include: matchingTags.map(GitHubActionsInclude.init(version:))
+                )
+                let encodedMatrix = try jsonEncoder.encode(matrix)
+                print(String(data: encodedMatrix, encoding: .utf8)!)
+            } else {
+                let encodedTags = try jsonEncoder.encode(matchingTags)
+                print(String(data: encodedTags, encoding: .utf8)!)
             }
-            .compactMap(SemanticVersion.init(_:))
-            .filter { $0.isStable && range.lowerBound <= $0 && $0 < range.upperBound }
+            return
+        }
 
-        for matchingTag in matchingTags {
-            let temporaryDirectory = FileManager.default.temporaryDirectory.appending(
-                path: packageDescription.name + "-" + ProcessInfo.processInfo.globallyUniqueString,
-                directoryHint: .isDirectory
-            )
-            if FileManager.default.fileExists(atPath: temporaryDirectory.path()) {
-                print("Directory exists at", temporaryDirectory.path(), ". Deleting before copying.")
-                try FileManager.default.removeItem(at: temporaryDirectory)
-            }
-            print("Copying package to", temporaryDirectory.path())
-            try FileManager.default.copyItem(
-                at: URL(filePath: packagePath ?? "./"),
-                to: temporaryDirectory
-            )
+        // TODO: It would be faster to copy to a temp directory, do the initial resolve, then keep some of the .build directory
 
-            defer {
-                print("Deleting temporary copy of package from", temporaryDirectory.path())
-                try? FileManager.default.removeItem(at: temporaryDirectory)
-            }
+        let progressTracker = ProgressTracker(versions: Array(matchingTags))
+        await progressTracker.startActivityIndicator()
 
-            let buildDirectory = temporaryDirectory.appending(path: ".build", directoryHint: .isDirectory)
-            if FileManager.default.fileExists(atPath: buildDirectory.path()) {
-                print("There's an existing .build directory at", buildDirectory.path(), ". Removing.")
-                try FileManager.default.removeItem(at: buildDirectory)
-            }
+        @concurrent
+        func testVersion(_ matchingTag: SemanticVersion) async {
+            await progressTracker.inProgressVersion(matchingTag, latestMessage: nil)
 
-            print("Resolving existing dependencies to enable resolving to a specific version.")
-            let resolveAllResult = try await Subprocess.run(
-                .name("swift"),
-                arguments: [
-                    "package",
-                    "--package-path", temporaryDirectory.path(),
-                    "resolve",
-                ],
-                output: .standardOutput,
-                error: .standardError
-            )
-
-            guard resolveAllResult.terminationStatus.isSuccess else {
-                throw ExitCode(1)
+            if mockTesting {
+                try? await Task.sleep(for: .seconds(.random(in: 1 ... 5)))
+                await progressTracker.passVersion(matchingTag)
+                return
             }
 
-            print("Resolving", dependencyName, "to", matchingTag)
-            let resolveResult = try await Subprocess.run(
-                .name("swift"),
-                arguments: [
-                    "package",
-                    "--package-path", temporaryDirectory.path(),
-                    "resolve",
-                    dependencyName,
-                    "--version", "\(matchingTag)",
-                ],
-                output: .standardOutput,
-                error: .standardError
-            )
+            do {
+                let temporaryDirectory = FileManager.default.temporaryDirectory.appending(
+                    path: packageDescription.name + "-" + dependencyName + "-" + matchingTag.description + "-" + ProcessInfo.processInfo.globallyUniqueString,
+                    directoryHint: .isDirectory
+                )
+                if FileManager.default.fileExists(atPath: temporaryDirectory.path()) {
+                    await progressTracker.inProgressVersion(
+                        matchingTag,
+                        latestMessage: "Directory exists at \(temporaryDirectory.path()). Deleting before copying."
+                    )
+                    try FileManager.default.removeItem(at: temporaryDirectory)
+                }
+                await progressTracker.inProgressVersion(
+                    matchingTag,
+                    latestMessage: "Copying package to \(temporaryDirectory.path())"
+                )
+                try FileManager.default.copyItem(
+                    at: URL(filePath: packagePath ?? "./"),
+                    to: temporaryDirectory
+                )
 
-            guard resolveResult.terminationStatus.isSuccess else {
-                throw ExitCode(1)
-            }
+                defer {
+                    try? FileManager.default.removeItem(at: temporaryDirectory)
+                }
 
-            let testResult = try await Subprocess.run(
-                .name("swift"),
-                arguments: [
-                    "test",
-                    "--package-path", temporaryDirectory.path(),
-                ],
-                output: .standardOutput,
-                error: .standardError
-            )
+                let buildDirectory = temporaryDirectory.appending(path: ".build", directoryHint: .isDirectory)
+                if FileManager.default.fileExists(atPath: buildDirectory.path()) {
 
-            guard resolveResult.terminationStatus.isSuccess else {
-                print("Tests failed for", matchingTag)
-                throw ExitCode(1)
+                    try FileManager.default.removeItem(at: buildDirectory)
+                }
+
+                await progressTracker.inProgressVersion(
+                    matchingTag,
+                    latestMessage: "Resolving existing dependencies to enable resolving to a specific version."
+                )
+                let resolveAllResult = try await Subprocess.run(
+                    .name("swift"),
+                    arguments: [
+                        "package",
+                        "--package-path", temporaryDirectory.path(),
+                        "resolve",
+                    ]
+                ) { execution, standardOutput in
+                    for try await line in standardOutput.lines() {
+                        await progressTracker.inProgressVersion(
+                            matchingTag,
+                            latestMessage: line
+                        )
+                    }
+                }
+
+                guard resolveAllResult.terminationStatus.isSuccess else {
+                    throw ExitCode(1)
+                }
+
+                await progressTracker.inProgressVersion(
+                    matchingTag,
+                    latestMessage: "Resolving \(dependencyName) to \(matchingTag)"
+                )
+                let resolveResult = try await Subprocess.run(
+                    .name("swift"),
+                    arguments: [
+                        "package",
+                        "--package-path", temporaryDirectory.path(),
+                        "resolve",
+                        dependencyName,
+                        "--version", "\(matchingTag)",
+                    ]
+                ) { execution, standardOutput in
+                    for try await line in standardOutput.lines() {
+                        await progressTracker.inProgressVersion(
+                            matchingTag,
+                            latestMessage: line
+                        )
+                    }
+                }
+
+                guard resolveResult.terminationStatus.isSuccess else {
+                    throw ExitCode(1)
+                }
+
+                let testResult = try await Subprocess.run(
+                    .name("swift"),
+                    arguments: [
+                        "test",
+                        "--package-path", temporaryDirectory.path(),
+                    ]
+                ) { execution, standardOutput in
+                    for try await line in standardOutput.lines() {
+                        await progressTracker.inProgressVersion(
+                            matchingTag,
+                            latestMessage: line
+                        )
+                    }
+                }
+
+                guard testResult.terminationStatus.isSuccess else {
+                    throw ExitCode(1)
+                }
+
+                await progressTracker.passVersion(matchingTag)
+            } catch {
+                await progressTracker.failVersion(matchingTag, reason: String(describing: error))
             }
         }
 
-        print("All tests passed!")
+        if numTests > 1 {
+            await withTaskGroup(of: Void.self) { taskGroup in
+                let concurrentTasks = min(numTests, matchingTags.count)
+                for index in 0 ..< concurrentTasks {
+                    let matchingTag = matchingTags[index]
+                    taskGroup.addTask(name: dependencyName + " at \(matchingTag)") {
+                        await testVersion(matchingTag)
+                    }
+                }
+
+                var nextIndex = concurrentTasks
+
+                for await _ in taskGroup {
+                    if nextIndex < matchingTags.count {
+                        let matchingTag = matchingTags[nextIndex]
+                        nextIndex += 1
+                        taskGroup.addTask(name: dependencyName + " at \(matchingTag)") {
+                            await testVersion(matchingTag)
+                        }
+                    }
+                }
+            }
+        } else {
+            for matchingTag in matchingTags {
+                await testVersion(matchingTag)
+            }
+        }
     }
+}
+
+actor ProgressTracker {
+    enum VersionStatus {
+        case pending
+        case inProgress(latestMessage: String?)
+        case passed
+        case failed(reason: String?)
+    }
+
+    private(set) var versions: OrderedDictionary<SemanticVersion, VersionStatus>
+
+    private let progressCharacters = Array("⣷⣯⣟⡿⢿⣻⣽⣾")
+
+//    private let progressCharacters = Array("|/-\\")
+
+    private var progressCharacterIndex = 0
+
+    private var animateActivityIndicatorTask: Task<Void, Error>?
+
+    private var hasPrintedProgress = false
+
+    init(versions: [SemanticVersion]) {
+        self.versions = OrderedDictionary(uniqueKeysWithValues: zip(versions, repeatElement(.pending, count: versions.count)))
+    }
+
+    deinit {
+        animateActivityIndicatorTask?.cancel()
+    }
+
+    func inProgressVersion(_ version: SemanticVersion, latestMessage: String?) {
+        versions[version] = .inProgress(latestMessage: latestMessage)
+
+        printProgress()
+    }
+
+    func passVersion(_ version: SemanticVersion) {
+        versions[version] = .passed
+
+        printProgress()
+    }
+
+    func failVersion(_ version: SemanticVersion, reason: String?) {
+        versions[version] = .failed(reason: reason)
+
+        printProgress()
+    }
+
+    func startActivityIndicator() {
+        guard animateActivityIndicatorTask == nil else { return }
+
+        animateActivityIndicatorTask = Task {
+            while true {
+                incrementProgress()
+                try await Task.sleep(for: .seconds(0.2))
+                try Task.checkCancellation()
+            }
+        }
+    }
+
+    func stopActivityIndicator() {
+        animateActivityIndicatorTask?.cancel()
+        animateActivityIndicatorTask = nil
+    }
+
+    private func printProgress() {
+        var index = 0
+        let statuses = versions.map { (version, status) in
+            index += 1
+
+            var statusString = "["
+            statusString += String(
+                repeating: " ",
+                count: "\(versions.count)".count - "\(index)".count
+            )
+            statusString += "\(index)/\(versions.count)] \(progressCharacters[progressCharacterIndex]) \(version): "
+
+            switch status {
+            case .pending:
+                statusString += "Pending..."
+            case .inProgress(let latestMessage):
+                statusString += latestMessage ?? "In progress..."
+            case .failed(let reason):
+                statusString += reason ?? "Failed."
+            case .passed:
+                statusString += "\u{1B}[0;92m􁁛\u{1B}[0m  Passed."
+            }
+
+            return statusString
+        }
+
+        var lines = statuses.joined(
+            separator: "\n"
+        )
+
+        if hasPrintedProgress {
+            let clearLine = "\u{1B}[1A\u{1B}[K"
+            lines = repeatElement(clearLine, count: statuses.count).joined() + lines
+        } else {
+            hasPrintedProgress = true
+        }
+
+        print(lines)
+    }
+
+    private func incrementProgress() {
+        if progressCharacters.index(after: progressCharacterIndex) == progressCharacters.endIndex {
+            progressCharacterIndex = 0
+        } else {
+            progressCharacterIndex = progressCharacters.index(after: progressCharacterIndex)
+        }
+
+        printProgress()
+    }
+}
+
+struct GitHubActionsMatrix: Encodable {
+    let include: [GitHubActionsInclude]
+}
+
+struct GitHubActionsInclude: Encodable {
+    let version: SemanticVersion
 }
 
 struct PackageDescription: Decodable {

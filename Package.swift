@@ -6,6 +6,9 @@ let package = Package(
     platforms: [
         .macOS(.v15),
     ],
+    products: [
+        .executable(name: "swift-dependency-compatibility-checker", targets: ["swift-dependency-compatibility-checker"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.6.2"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),

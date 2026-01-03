@@ -145,8 +145,18 @@ struct SwiftDependencyCompatibilityChecker: AsyncParsableCommand {
         let progressTracker = ProgressTracker(versions: Array(matchingTags))
         await progressTracker.startActivityIndicator()
 
+        #if swift(>=6.2)
         @concurrent
         func testVersion(_ matchingTag: SemanticVersion) async {
+            await _testVersion(matchingTag)
+        }
+        #else
+        nonisolated
+        func testVersion(_ matchingTag: SemanticVersion) async {
+            await _testVersion(matchingTag)
+        }
+        #endif
+        func _testVersion(_ matchingTag: SemanticVersion) async {
             await progressTracker.inProgressVersion(matchingTag, latestMessage: nil)
 
             if mockTesting {
@@ -276,7 +286,7 @@ struct SwiftDependencyCompatibilityChecker: AsyncParsableCommand {
                 let concurrentTasks = min(numTests, matchingTags.count)
                 for index in 0 ..< concurrentTasks {
                     let matchingTag = matchingTags[index]
-                    taskGroup.addTask(name: dependencyName + " at \(matchingTag)") {
+                    taskGroup.addTask {
                         await testVersion(matchingTag)
                     }
                 }
@@ -287,7 +297,7 @@ struct SwiftDependencyCompatibilityChecker: AsyncParsableCommand {
                     if nextIndex < matchingTags.count {
                         let matchingTag = matchingTags[nextIndex]
                         nextIndex += 1
-                        taskGroup.addTask(name: dependencyName + " at \(matchingTag)") {
+                        taskGroup.addTask {
                             await testVersion(matchingTag)
                         }
                     }

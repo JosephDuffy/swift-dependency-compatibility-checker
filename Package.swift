@@ -1,10 +1,10 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(
     name: "swift-dependency-compatibility-checker",
     platforms: [
-        .macOS(.v15),
+        .macOS(.v14),
     ],
     products: [
         .executable(name: "swift-dependency-compatibility-checker", targets: ["swift-dependency-compatibility-checker"]),
@@ -25,5 +25,6 @@ let package = Package(
                 "SemanticVersion",
             ]
         ),
-    ]
+    ],
+    swiftLanguageVersions: [.v5, .version("6")]
 )
